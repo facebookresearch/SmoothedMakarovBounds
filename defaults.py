@@ -2,7 +2,7 @@
 Copyright (c) Meta Platforms, Inc. and affiliates.
 """
 
-# The following defaults experiments
+# The following default experiments
 FNA_METHODS = ["envelope_marginal", "smoothing_marginal"]
 FNA_LGB_PARAMS = {
     "boosting_type": "gbdt",
