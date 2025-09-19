@@ -1,0 +1,947 @@
+"""
+Copyright (c) Meta Platforms, Inc. and affiliates.
+"""
+
+import logging
+import math
+from typing import List, NamedTuple, Optional, Union
+
+import defaults
+
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+
+from data import get_scm, load_data, SCM, SCM_synthetic
+from methodology import (
+    compute_envelope_estimator,
+    compute_makarov_bounds_approx,
+    tune_smoothing_params,
+)
+from nuisances import (
+    estimate_ecdfs,
+    get_nuisance_model_predictions,
+    train_conditional_cdf,
+)
+from utils import set_seeds
+
+FNA_METHODS_COVARIATE = [
+    "envelope_covariate",
+    "smoothing_covariate",
+    "plugin_covariate",
+]
+
+FNA_METHODS_MARGINAL = [
+    "envelope_marginal",
+    "smoothing_marginal",
+    "plugin_marginal",
+]
+
+
+class MonteCarloResults(NamedTuple):
+    fna_results: dict
+    metrics_results: dict
+
+
+class ResultsPerSweep(NamedTuple):
+    results_fna_aggregated: dict
+    results_metrics_aggregated: dict
+
+
+# Main workflow --------------------------------
+def run(
+    data_config: dict,
+    deltas: list,
+    y_grid_size: int = defaults.FNA_MAX_Y_GRID_SIZE,
+    monte_carlo_samples: int = 2000,
+    monte_carlo_batches: int = 5,
+    lgb_params: dict = defaults.FNA_LGB_PARAMS,
+    t1: Union[int, List[int]] = defaults.FNA_T1,
+    t2: Union[int, List[int]] = defaults.FNA_T2,
+    methods: list = defaults.FNA_METHODS,
+    bound_types: list = ["lower", "upper"],
+    alpha: float = 0.05,
+    seed: int = 0,
+    sweep_config: Optional[dict] = None,
+    use_gt_nuisances: bool = False,
+    plot_nuisance_fits: bool = True,
+    tune_method: str = "lepski",
+) -> FinalResults:
+    runs_per_batch = monte_carlo_samples // monte_carlo_batches
+    if sweep_config is None:
+        results = monte_carlo_runs(
+            y_grid_size=y_grid_size,
+            runs_per_batch=runs_per_batch,
+            monte_carlo_batches=monte_carlo_batches,
+            lgb_params=lgb_params,
+            data_config=data_config,
+            deltas=deltas,
+            t1=t1,
+            t2=t2,
+            methods=methods,
+            bound_types=bound_types,
+            alpha=alpha,
+            seed=seed,
+            use_gt_nuisances=use_gt_nuisances,
+            plot_nuisance_fits=plot_nuisance_fits,
+            tune_method=tune_method,
+        )
+        return FinalResults(
+            plots=results.plots,
+            results_over_sweeps={0: results},
+        )
+    else:
+        results = {}
+        sweep_config_dict = {
+            "y_grid_size": y_grid_size,
+            "lgb_params": lgb_params,
+            "data_config": data_config,
+            "t1": t1,
+            "t2": t2,
+        }
+        for value in sweep_config["values"]:
+            # Update the dictionary with the current sweep value
+            if sweep_config["parameter"].startswith("data_config["):
+                # Extract the key inside the brackets
+                key = sweep_config["parameter"].split("[")[1].strip("]\"'")
+                data_config_value = sweep_config_dict["data_config"]
+                if isinstance(data_config_value, dict):
+                    data_config_value[key] = value
+            else:
+                sweep_config_dict[sweep_config["parameter"]] = value
+            results[value] = monte_carlo_runs(
+                y_grid_size=int(sweep_config_dict["y_grid_size"]),
+                runs_per_batch=runs_per_batch,
+                monte_carlo_batches=monte_carlo_batches,
+                lgb_params=sweep_config_dict["lgb_params"],  # pyre-ignore[6]
+                data_config=sweep_config_dict["data_config"],  # pyre-ignore[6]
+                deltas=deltas,
+                t1=sweep_config_dict["t1"],  # pyre-ignore[6]
+                t2=sweep_config_dict["t2"],  # pyre-ignore[6]
+                methods=methods,
+                bound_types=bound_types,
+                alpha=alpha,
+                seed=seed,
+                sweep_value=value,
+                use_gt_nuisances=use_gt_nuisances,
+                plot_nuisance_fits=plot_nuisance_fits,
+                tune_method=tune_method,
+            )
+
+        return create_final_results(results)
+
+
+def monte_carlo_runs(
+    data_config: dict,
+    deltas: list,
+    y_grid_size: int = defaults.FNA_MAX_Y_GRID_SIZE,
+    runs_per_batch: int = 400,
+    monte_carlo_batches: int = 5,
+    lgb_params: dict = defaults.FNA_LGB_PARAMS,
+    t1: Union[int, List[int]] = defaults.FNA_T1,
+    t2: Union[int, List[int]] = defaults.FNA_T2,
+    methods: list = defaults.FNA_METHODS,
+    bound_types: list = ["lower", "upper"],
+    alpha: float = 0.05,
+    seed: int = 0,
+    sweep_value: Union[int, float] = 0,
+    use_gt_nuisances: bool = False,
+    plot_nuisance_fits: bool = True,
+    tune_method: str = "lepski",
+) -> ResultsPerSweep:
+    results = []
+    set_seeds(seed)
+    scm = get_scm(data_config)
+    for i in range(monte_carlo_batches):
+        logging.info(f"Running batch {i+1} of {monte_carlo_batches}")
+        seed = np.random.randint(0, 1000000)
+        results.append(
+            batched_monte_carlo_run(
+                seed=seed,
+                runs_per_batch=runs_per_batch,
+                scm=scm,
+                y_grid_size=y_grid_size,
+                lgb_params=lgb_params,
+                data_config=data_config,
+                deltas=deltas,
+                t1=t1,
+                t2=t2,
+                methods=methods,
+                bound_types=bound_types,
+                alpha=alpha,
+                use_gt_nuisances=use_gt_nuisances,
+                tune_method=tune_method,
+                custom_name=f"Batch {i+1} of {monte_carlo_batches} Monte Carlo Batches, sweep {sweep_value}",
+            )
+        )
+    return create_results_per_sweep(
+        scm=scm,
+        results=results,
+        data_config=data_config,
+        y_grid_size=y_grid_size,
+        use_gt_nuisances=use_gt_nuisances,
+        plot_nuisance_fits=plot_nuisance_fits,
+        lgb_params=lgb_params,
+        custom_name=f"Results for sweep {sweep_value}",
+    )
+
+
+# Operator for a batch of Monte Carlo runs
+def batched_monte_carlo_run(
+    scm: SCM,
+    data_config: dict,
+    deltas: list,
+    seed: int = 0,
+    runs_per_batch: int = 400,
+    y_grid_size: int = defaults.FNA_MAX_Y_GRID_SIZE,
+    lgb_params: dict = defaults.FNA_LGB_PARAMS,
+    t1: Union[int, List[int]] = defaults.FNA_T1,
+    t2: Union[int, List[int]] = defaults.FNA_T2,
+    methods: list = defaults.FNA_METHODS,
+    bound_types: list = ["lower", "upper"],
+    alpha: float = 0.05,
+    use_gt_nuisances: bool = False,
+    tune_method: str = "lepski",
+) -> List[MonteCarloResults]:
+    set_seeds(seed)
+    results = []
+    for i in range(runs_per_batch):
+        logging.info(f"Running run {i+1} of {runs_per_batch}")
+        seed_run = np.random.randint(0, 1000000)
+        results.append(
+            single_monte_carlo_run(
+                seed=seed_run,
+                scm=scm,
+                y_grid_size=y_grid_size,
+                lgb_params=lgb_params,
+                data_config=data_config,
+                deltas=deltas,
+                t1=t1,
+                t2=t2,
+                methods=methods,
+                bound_types=bound_types,
+                alpha=alpha,
+                use_gt_nuisances=use_gt_nuisances,
+                tune_method=tune_method,
+            )
+        )
+    return results
+
+
+def single_monte_carlo_run(
+    scm: SCM,
+    data_config: dict,
+    deltas: list,
+    seed: int = 0,
+    y_grid_size: int = defaults.FNA_MAX_Y_GRID_SIZE,
+    lgb_params: dict = defaults.FNA_LGB_PARAMS,
+    t1: Union[int, List[int]] = defaults.FNA_T1,
+    t2: Union[int, List[int]] = defaults.FNA_T2,
+    methods: list = defaults.FNA_METHODS,
+    bound_types: list = ["lower", "upper"],
+    alpha: float = 0.05,
+    use_gt_nuisances: bool = False,
+    tune_method: str = "lepski",
+) -> MonteCarloResults:
+    set_seeds(seed)
+    # Whether to tune smoothing params or not
+    tune = False
+    if not isinstance(t1, int) or not isinstance(t2, int):
+        if "smoothing_marginal" in methods or "smoothing_covariate" in methods:
+            tune = True
+    # Load data --------------------------
+    data_collection = load_data(
+        scm, data_config=data_config, deltas=deltas, y_grid_size=y_grid_size
+    )
+    # Nuisance parameters ---------------
+    # Empirical CDFs
+    nuisance_results = {}
+    if not use_gt_nuisances:
+        if any(m in methods for m in FNA_METHODS_MARGINAL):
+            nuisance_results["ecdfs"] = estimate_ecdfs(data_collection, deltas)
+
+        # Conditional CDFs with LightGBM
+        if any(m in methods for m in FNA_METHODS_COVARIATE):
+            nuisance_results["model_1"] = train_conditional_cdf(
+                1, data_collection, lgb_params, scm.outcome_type
+            )
+            nuisance_results["model_0"] = train_conditional_cdf(
+                0, data_collection, lgb_params, scm.outcome_type
+            )
+            nuisance_results["model_1_preds"] = get_nuisance_model_predictions(
+                nuisance_results["model_1"],
+                data_collection,
+                1,
+                0,
+                train_preds=tune,
+            )
+            nuisance_results["model_0_preds"] = {}
+    elif isinstance(scm, SCM_synthetic):
+        # Use ground truth nuisance functions
+        F1 = scm.response1_marginal(data_collection["d_test"]["x"]).cdf(
+            data_collection["y_grids"][1]
+        )
+        if any(m in methods for m in FNA_METHODS_COVARIATE):
+            nuisance_results["model_1_preds"] = {"d_test": F1}
+            if tune:
+                nuisance_results["model_1_preds"]["d_train"] = scm.response1_marginal(
+                    data_collection["d_train"]["x"]
+                ).cdf(data_collection["y_grids"][1])
+            nuisance_results["model_0_preds"] = {}
+        if any(m in methods for m in FNA_METHODS_MARGINAL):
+            nuisance_results["ecdfs"] = {
+                "full": {1: np.mean(F1, axis=0, keepdims=True), 0: {}}
+            }
+    else:
+        raise ValueError("Ground truth nuisance functions not implemented")
+
+    # FNA estimation -------------
+    fna_results = {
+        delta: {
+            method: {bound_type: {} for bound_type in bound_types} for method in methods
+        }
+        for delta in deltas
+    }
+    metrics_results = {delta: {method: {} for method in methods} for delta in deltas}
+    for delta in deltas:
+        y_grid1 = data_collection["y_grids"][1]
+        y_grid0 = data_collection["y_grids"][0][delta]
+        if any(m in methods for m in FNA_METHODS_COVARIATE):
+            # Get model predictions for cdf 0 (depending on delta)
+            if not use_gt_nuisances:
+                nuisance_results["model_0_preds"][delta] = (
+                    get_nuisance_model_predictions(
+                        nuisance_results["model_0"],
+                        data_collection,
+                        0,
+                        delta,
+                        train_preds=tune,
+                    )
+                )
+            elif isinstance(scm, SCM_synthetic):
+                F0 = scm.response0_marginal(data_collection["d_test"]["x"]).cdf(
+                    data_collection["y_grids"][0][delta]
+                )
+                if any(m in methods for m in FNA_METHODS_COVARIATE):
+                    nuisance_results["model_0_preds"][delta] = {"d_test": F0}
+                    if tune:
+                        nuisance_results["model_0_preds"][delta]["d_train"] = (
+                            scm.response0_marginal(data_collection["d_train"]["x"]).cdf(
+                                data_collection["y_grids"][0][delta]
+                            )
+                        )
+                if any(m in methods for m in FNA_METHODS_MARGINAL):
+                    nuisance_results["ecdfs"]["full"][0][delta] = np.mean(
+                        F0, axis=0, keepdims=True
+                    )
+            else:
+                raise ValueError("Ground truth nuisance functions not implemented")
+
+        # FNA computation for lower and upper bounds
+        gt_marginal = {"lower": None, "upper": None}
+        gt_covariate = {"lower": None, "upper": None}
+
+        for bound_type in bound_types:
+            # Ground truth
+            if "makarov_bounds_marginal" in data_collection["ground_truth"]:
+                gt_marginal[bound_type] = data_collection["ground_truth"][
+                    "makarov_bounds_marginal"
+                ][delta][bound_type]
+            elif "fna" in data_collection["ground_truth"]:
+                # Choose fna as ground truth if ground-truth bounds are not available
+                gt_marginal[bound_type] = data_collection["ground_truth"]["fna"][delta]
+            if "makarov_bounds_covariate" in data_collection["ground_truth"]:
+                gt_covariate[bound_type] = data_collection["ground_truth"][
+                    "makarov_bounds_covariate"
+                ][delta][bound_type]
+            elif "fna" in data_collection["ground_truth"]:
+                # Choose fna as ground truth if ground-truth bounds are not available
+                gt_covariate[bound_type] = data_collection["ground_truth"]["fna"][delta]
+            # Plugin bounds
+            for method in methods:
+                if "marginal" in method:
+                    cdf1_test = nuisance_results["ecdfs"]["full"][1]
+                    cdf0_test = nuisance_results["ecdfs"]["full"][0][delta]
+                    cdf1_train = cdf1_test
+                    cdf0_train = cdf0_test
+                    # Add ground-truth
+                    if gt_marginal[bound_type] is not None:
+                        fna_results[delta][method][bound_type]["ground_truth"] = (
+                            gt_marginal[bound_type]
+                        )
+                elif "covariate" in method:
+                    cdf1_test = nuisance_results["model_1_preds"]["d_test"]
+                    cdf0_test = nuisance_results["model_0_preds"][delta]["d_test"]
+                    cdf1_train = nuisance_results["model_1_preds"]["d_train"]
+                    cdf0_train = nuisance_results["model_0_preds"][delta]["d_train"]
+                    # Add ground-truth
+                    if gt_covariate[bound_type] is not None:
+                        fna_results[delta][method][bound_type]["ground_truth"] = (
+                            gt_covariate[bound_type]
+                        )
+                else:
+                    raise ValueError("Invalid method")
+                if "plugin" in method:
+                    fna_results[delta][method][bound_type] = compute_envelope_estimator(
+                        bound_type=bound_type,
+                        y_grid1=y_grid1,
+                        y_grid0=y_grid0,
+                        cdf1=cdf1_test,
+                        cdf0=cdf0_test,
+                        pi=0.5,
+                        A=data_collection["d_test"]["a"],
+                        Y=data_collection["d_test"]["y"],
+                        alpha=alpha,
+                        method="dm",
+                    )
+                elif "envelope" in method:
+                    fna_results[delta][method][bound_type] = compute_envelope_estimator(
+                        bound_type=bound_type,
+                        y_grid1=y_grid1,
+                        y_grid0=y_grid0,
+                        cdf1=cdf1_test,
+                        cdf0=cdf0_test,
+                        pi=0.5,
+                        A=data_collection["d_test"]["a"],
+                        Y=data_collection["d_test"]["y"],
+                        alpha=alpha,
+                    )
+                elif "smoothing" in method:
+                    # Tune t if necessary
+                    if not isinstance(t1, int) or not isinstance(t2, int):
+                        t1_tuned, t2_tuned = tune_smoothing_params(
+                            bound_type=bound_type,
+                            y_grid1=y_grid1,
+                            y_grid0=y_grid0,
+                            t1_grid=t1,
+                            t2_grid=t2,
+                            cdf1=cdf1_train,
+                            cdf0=cdf0_train,
+                            pi=0.5,
+                            A=data_collection["d_train"]["a"],
+                            Y=data_collection["d_train"]["y"],
+                            n_test=data_collection["d_test"]["a"].shape[0],
+                            outcome_type=scm.outcome_type,
+                            alpha=alpha,
+                            tune_method=tune_method,
+                        )
+                    else:
+                        t1_tuned = t1
+                        t2_tuned = t2
+                    fna_results[delta][method][bound_type] = (
+                        compute_makarov_bounds_approx(
+                            bound_type=bound_type,
+                            y_grid1=y_grid1,
+                            y_grid0=y_grid0,
+                            t1=t1_tuned,
+                            t2=t2_tuned,
+                            cdf1=cdf1_test,
+                            cdf0=cdf0_test,
+                            pi=0.5,
+                            A=data_collection["d_test"]["a"],
+                            Y=data_collection["d_test"]["y"],
+                            outcome_type=scm.outcome_type,
+                            alpha=alpha,
+                        )
+                    )
+                    fna_results[delta][method][bound_type]["t1"] = t1_tuned
+                    fna_results[delta][method][bound_type]["t2"] = t2_tuned
+
+        # Compute metrics
+        for method in methods:
+            if "marginal" in method:
+                gt = gt_marginal
+            elif "covariate" in method:
+                gt = gt_covariate
+            else:
+                raise ValueError("Invalid method")
+            metrics_results[delta][method] = compute_metrics(
+                fna_results[delta][method], gt
+            )
+
+    return MonteCarloResults(fna_results=fna_results, metrics_results=metrics_results)
+
+
+def compute_metrics(fna_results_dict, gt_dict):
+    metrics_dict = {}
+    bound_types = list(fna_results_dict.keys())
+    for bound_type in bound_types:
+        if "t1" in fna_results_dict[bound_type].keys():
+            metrics_dict[f"t1_{bound_type}"] = fna_results_dict[bound_type]["t1"]
+            metrics_dict[f"t2_{bound_type}"] = fna_results_dict[bound_type]["t2"]
+
+        if gt_dict[bound_type] is not None:
+            metrics_dict[f"point_err_{bound_type}"] = np.absolute(
+                fna_results_dict[bound_type]["point_est"] - gt_dict[bound_type]
+            )
+            if bound_type == "upper":
+                metrics_dict["width_upper"] = (
+                    fna_results_dict["upper"]["ci"] - gt_dict["upper"]
+                )
+                metrics_dict["coverage_upper"] = (
+                    fna_results_dict["upper"]["ci"] >= gt_dict["upper"]
+                )
+            else:
+                metrics_dict["width_lower"] = (
+                    gt_dict["lower"] - fna_results_dict["lower"]["ci"]
+                )
+                metrics_dict["coverage_lower"] = (
+                    fna_results_dict["lower"]["ci"] <= gt_dict["lower"]
+                )
+
+    if gt_dict["lower"] is not None and gt_dict["upper"] is not None:
+        if "lower" in bound_types and "upper" in bound_types:
+            metrics_dict["coverage_joint"] = (
+                fna_results_dict["upper"]["ci"] >= gt_dict["upper"]
+            ) & (fna_results_dict["lower"]["ci"] <= gt_dict["lower"])
+
+    return metrics_dict
+
+
+def create_results_per_sweep(
+    scm: SCM,
+    results: list,
+    data_config: dict,
+    y_grid_size: int = defaults.FNA_MAX_Y_GRID_SIZE,
+    use_gt_nuisances: bool = False,
+    plot_nuisance_fits: bool = True,
+    lgb_params: dict = defaults.FNA_LGB_PARAMS,
+) -> ResultsPerSweep:
+    # Store results in numpy arrays
+    deltas = list(results[0][0].fna_results.keys())
+    methods = list(results[0][0].fna_results[deltas[0]].keys())
+    bound_types = list(results[0][0].fna_results[deltas[0]][methods[0]].keys())
+
+    agg_data_fna = {
+        delta: {
+            bound_type: {method: {"mean": {}, "std": {}} for method in methods}
+            for bound_type in bound_types
+        }
+        for delta in deltas
+    }
+    agg_data_metrics = {
+        delta: {method: {"mean": {}, "std": {}} for method in methods}
+        for delta in deltas
+    }
+    # Average results over runs
+    for delta in deltas:
+        for method in methods:
+            # Aggregate fna results
+            for bound_type in bound_types:
+                measurements = list(
+                    results[0][0].fna_results[delta][method][bound_type].keys()
+                )
+                avg_list = {measure: [] for measure in measurements}
+                for i in range(len(results)):
+                    for j in range(len(results[i])):
+                        results_run = results[i][j].fna_results[delta][method][
+                            bound_type
+                        ]
+                        for measure in measurements:
+                            avg_list[measure].append(results_run[measure])
+                for measure in measurements:
+                    agg_data_fna[delta][bound_type][method]["mean"][measure] = np.mean(
+                        avg_list[measure], axis=0
+                    )
+                    agg_data_fna[delta][bound_type][method]["std"][measure] = (
+                        np.std(avg_list[measure], axis=0)
+                        / np.sqrt(len(avg_list[measure]))
+                    ) * 1.96
+            # Aggregate metric results
+            metrics = list(results[0][0].metrics_results[delta][method].keys())
+            for metric in metrics:
+                avg_list_metrics = []
+                for i in range(len(results)):
+                    for j in range(len(results[i])):
+                        results_run = results[i][j].metrics_results[delta][method]
+                        avg_list_metrics.append(results_run[metric])
+                agg_data_metrics[delta][method]["mean"][metric] = np.mean(
+                    avg_list_metrics
+                )
+                agg_data_metrics[delta][method]["std"][metric] = (
+                    np.std(avg_list_metrics) / np.sqrt(len(avg_list_metrics)) * 1.96
+                )
+
+    results_plots = []
+
+    # Plot fna over delta
+    # Plot estimated bounds + CIs over sweep values
+    if len(deltas) > 1:
+        plot_data_struct = {
+            delta: ResultsPerSweep(
+                plots=results_plots,
+                results_fna_aggregated={0: agg_data_fna[delta]},
+                results_metrics_aggregated={},
+            )
+            for delta in deltas
+        }
+        fig_fnas, axes = plot_fnas_over_sweep_seaborn(
+            plot_data_struct, sweep_name="delta"
+        )
+        results_plots.append(plot_to_png(fig_fnas))
+
+    # Plot counterfactuals
+    if isinstance(scm, SCM_synthetic):
+        # Plot counterfactual distributions
+        X, _, _ = scm.sample(100000)
+        Y1, Y0 = scm.sample_counterfactuals(X)
+        # Plot counterfactual distributions
+        fig_cf, axes = plt.subplots(1, 3, figsize=(12, 8), sharex=True, sharey=True)
+        axes = axes.flatten()
+        for ax, Y in zip(axes, [Y1, Y0]):
+            sns.histplot(Y, ax=ax)
+            ax.set_title(f"Y{'1' if Y is Y1 else '0'}")
+        # Treatment effect distribution
+        sns.histplot(Y1 - Y0, ax=axes[-1])
+        axes[-1].set_title("Y1 - Y0")
+        fig_cf.suptitle("Counterfactual distributions", fontsize=16)
+        results_plots.append(plot_to_png(fig_cf))
+
+    # Plot distribution of y_star1 and y_star0
+    fig_y_star, axes = plt.subplots(1, 4, figsize=(20, 10), sharex=True, sharey=True)
+    axes = axes.flatten()
+    y_star_dict = {
+        "y_star_1_lower": [],
+        "y_star_1_upper": [],
+        "y_star_0_lower": [],
+        "y_star_0_upper": [],
+    }
+    for delta in deltas:
+        for method in ["envelope_marginal"]:
+            # Aggregate fna results
+            for bound_type in bound_types:
+                for i in range(len(results)):
+                    for j in range(len(results[i])):
+                        results_run = results[i][j].fna_results[delta][method][
+                            bound_type
+                        ]
+                        if bound_type == "lower":
+                            y_star_dict["y_star_1_lower"].append(
+                                float(results_run["y_star1"].squeeze())
+                            )
+                            y_star_dict["y_star_0_lower"].append(
+                                float(results_run["y_star0"].squeeze())
+                            )
+                        else:
+                            y_star_dict["y_star_1_upper"].append(
+                                float(results_run["y_star1"].squeeze())
+                            )
+                            y_star_dict["y_star_0_upper"].append(
+                                float(results_run["y_star0"].squeeze())
+                            )
+    for ax, y_star in zip(
+        axes,
+        ["y_star_1_upper", "y_star_1_lower", "y_star_0_upper", "y_star_0_lower"],
+    ):
+        sns.histplot(y_star_dict[y_star], ax=ax)
+        ax.set_title(f"{y_star}")
+        fig_y_star.suptitle("y_star1 and y_star0", fontsize=16)
+    plt.show(fig_y_star)
+
+    # Outputs
+    return ResultsPerSweep(
+        results_fna_aggregated=agg_data_fna,
+        results_metrics_aggregated=agg_data_metrics,
+    )
+
+
+def create_final_results(
+    results_per_sweep: dict[Union[int, float], ResultsPerSweep],
+):
+    # Metadata
+    sweep_values = list(results_per_sweep.keys())
+    deltas = list(results_per_sweep[sweep_values[0]].results_fna_aggregated.keys())
+
+    # Plots ----------------------------
+    results_plots = []
+
+    # Plot estimated bounds + CIs over sweep values
+    fig_fnas, _ = plot_fnas_over_sweep_seaborn(results_per_sweep)
+    plt.show(fig_fnas)
+    # Plot metrics over sweep values
+    fig_metrics = plot_metrics_grid_seaborn(
+        results_per_sweep,
+        delta=deltas[0],
+        title="MSE / Coverage / Width — marginal vs covariate",
+    )
+    plt.show(fig_metrics)
+    print(results_over_sweeps)
+
+
+def plot_fnas_over_sweep_seaborn(
+    results_per_sweep: dict[Union[int, float], ResultsPerSweep],
+    delta: Optional[Union[int, float]] = None,
+    title: Optional[str] = None,
+    sweep_name: str = "sweep",
+):
+    if title is None:
+        title = f"Estimated bounds over {sweep_name} values"
+    # Match your original color mapping
+    METHOD_COLORS = {
+        "envelope": (0, 0, 139),  # darkblue
+        "smoothing": (0, 100, 0),  # darkgreen
+    }
+
+    def _rgb255_to_mpl(rgb_tuple_255):
+        r, g, b = rgb_tuple_255
+        return (r / 255.0, g / 255.0, b / 255.0)
+
+    def _colors_for(method_base_name):
+        r, g, b = METHOD_COLORS.get(method_base_name, (80, 80, 80))  # fallback gray
+        line = _rgb255_to_mpl((r, g, b))
+        fill_alpha = 0.18
+        return line, fill_alpha
+
+    def _split_method(m):
+        base, _, suffix = m.rpartition("_")
+        return (base or m, suffix)  # if no underscore, base=m, suffix=""
+
+    sns.set_theme(style="whitegrid")
+    # ---- metadata ----
+    sweep_values = sorted(results_per_sweep.keys())
+    first_sv = sweep_values[0]
+    deltas = list(results_per_sweep[first_sv].results_fna_aggregated.keys())
+    if delta is None:
+        delta = deltas[0]
+    bound_types = list(results_per_sweep[first_sv].results_fna_aggregated[delta].keys())
+    methods = list(
+        results_per_sweep[first_sv].results_fna_aggregated[delta][bound_types[0]].keys()
+    )
+
+    # Partition by suffix
+    marginal = [m for m in methods if m.endswith("_marginal")]
+    covariate = [m for m in methods if m.endswith("_covariate")]
+    if not marginal and not covariate:
+        marginal = methods  # fallback if no suffixes present
+
+    # Extract time series
+    def series(series_metric, bound_type, method):
+        ys = []
+        for sv in sweep_values:
+            ys.append(
+                results_per_sweep[sv].results_fna_aggregated[delta][bound_type][method][
+                    "mean"
+                ][series_metric]
+            )
+        return ys
+
+    # ---- figure ----
+    fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(14, 6), sharey=True)
+    axes = np.atleast_1d(axes).ravel()  # ensure 1D
+
+    def add_panel(method_list, ax, panel_title):
+        legend_handles = {}
+
+        for m in method_list:
+            base, _ = _split_method(m)
+            line_color, fill_alpha = _colors_for(base)
+
+            for b in bound_types:
+                if b == "lower":
+                    y_lower = series("ci", b, m)
+                    y_upper = series("point_est", b, m)
+                else:
+                    y_lower = series("point_est", b, m)
+                    y_upper = series("ci", b, m)
+
+                # CI band
+                ax.fill_between(
+                    sweep_values,
+                    np.array(y_lower).squeeze(),
+                    np.array(y_upper).squeeze(),
+                    alpha=fill_alpha,
+                    edgecolor="none",
+                    facecolor=line_color,
+                )
+
+                # Point estimate line
+                (line_handle,) = ax.plot(
+                    sweep_values,
+                    np.array(series("point_est", b, m)).squeeze(),
+                    linewidth=2,
+                    color=line_color,
+                    label=base,  # one label per base
+                )
+                legend_handles.setdefault(base, line_handle)
+
+        # Ground-truth line(s) for the panel
+        if method_list:
+            rep = method_list[0]
+            for b in bound_types:
+                try:
+                    gt_vals = series("ground_truth", b, rep)
+                except KeyError:
+                    continue
+                (gt_handle,) = ax.plot(
+                    sweep_values,
+                    np.array(gt_vals).squeeze(),
+                    linewidth=2,
+                    linestyle=":",
+                    color="red",
+                    label="Ground truth",
+                )
+                legend_handles.setdefault("Ground truth", gt_handle)
+
+        ax.set_title(panel_title)
+        return legend_handles
+
+    left_handles = add_panel(marginal, axes[0], "Marginal methods")
+    _ = add_panel(covariate, axes[1], "Covariate methods")
+
+    for ax in axes:
+        ax.set_xlabel(sweep_values)
+    axes[0].set_ylabel("value")
+    fig.suptitle(title, y=0.98)
+
+    # Right-side legend (use handles from left panel to avoid duplicates)
+    handles = list(left_handles.values())
+    labels = [h.get_label() for h in handles]
+    fig.subplots_adjust(right=0.82, top=0.88)
+    fig.legend(handles, labels, loc="center left", bbox_to_anchor=(0.84, 0.5))
+    fig.tight_layout(rect=[0.0, 0.0, 0.82, 0.88])
+
+    sns.despine(fig)  # clean up spines a bit
+    return fig, axes
+
+
+# -------------------------------------------------------------------
+# Metrics grid (rows = metrics, cols = [marginal, covariate])
+# -------------------------------------------------------------------
+
+
+def plot_metrics_grid_seaborn(
+    results_per_sweep: dict[Union[int, float], ResultsPerSweep],
+    delta: Optional[Union[int, float]] = None,
+    title="MSE / Coverage / Width — marginal vs covariate",
+):
+    sweep_values = list(results_per_sweep.keys())
+    deltas = list(results_per_sweep[sweep_values[0]].results_fna_aggregated.keys())
+    bound_types = list(
+        results_per_sweep[sweep_values[0]].results_fna_aggregated[deltas[0]].keys()
+    )
+    methods = list(
+        results_per_sweep[sweep_values[0]]
+        .results_fna_aggregated[deltas[0]][bound_types[0]]
+        .keys()
+    )
+    metrics = list(
+        {
+            key
+            for method in methods
+            for key in results_per_sweep[sweep_values[0]]
+            .results_metrics_aggregated[delta][method]["mean"]
+            .keys()
+        }
+    )
+    # Match your original color mapping
+    METHOD_COLORS = {
+        "envelope": (0, 0, 139),  # darkblue
+        "smoothing": (0, 100, 0),  # darkgreen
+        "plugin": (100, 100, 0),  # other
+    }
+
+    def _rgb255_to_mpl(rgb_tuple_255):
+        r, g, b = rgb_tuple_255
+        return (r / 255.0, g / 255.0, b / 255.0)
+
+    def _colors_for(method_base_name):
+        r, g, b = METHOD_COLORS.get(method_base_name, (80, 80, 80))  # fallback gray
+        line = _rgb255_to_mpl((r, g, b))
+        fill_alpha = 0.18
+        return line, fill_alpha
+
+    def _split_method(m):
+        base, _, suffix = m.rpartition("_")
+        return (base or m, suffix)  # if no underscore, base=m, suffix=""
+
+    sns.set_theme(style="whitegrid")
+
+    sweep_values = sorted(results_per_sweep.keys())
+    first_sv = sweep_values[0]
+    deltas = list(results_per_sweep[first_sv].results_metrics_aggregated.keys())
+    if delta is None:
+        delta = deltas[0]
+    methods = list(results_per_sweep[first_sv].results_metrics_aggregated[delta].keys())
+
+    marginal_methods = [m for m in methods if m.endswith("_marginal")]
+    covariate_methods = [m for m in methods if m.endswith("_covariate")]
+    if not marginal_methods and not covariate_methods:
+        marginal_methods = methods  # fallback
+
+    def series(stat_key, method, metric_name):
+        vals = []
+        for sv in sweep_values:
+            node = (
+                results_per_sweep[sv].results_metrics_aggregated[delta].get(method, {})
+            )
+            stats = node.get(stat_key, {})
+            vals.append(stats.get(metric_name, float("nan")))
+        return vals
+
+    rows = len(metrics)
+    fig, axes = plt.subplots(nrows=rows, ncols=2, figsize=(10, 4 * rows), sharex=True)
+    if rows == 1:
+        axes = axes.reshape(1, 2)
+    axes = np.asarray(axes)
+
+    legend_handles = {}
+
+    def add_panel(method_list, ax, metric_name):
+        for m in method_list:
+            base, _ = _split_method(m)
+            line_color, fill_alpha = _colors_for(base)
+
+            y_mean = series("mean", m, metric_name)
+            y_std = series("std", m, metric_name)
+            y_lower = [
+                ((ym - ys) if not (math.isnan(ym) or math.isnan(ys)) else float("nan"))
+                for ym, ys in zip(y_mean, y_std)
+            ]
+            y_upper = [
+                ((ym + ys) if not (math.isnan(ym) or math.isnan(ys)) else float("nan"))
+                for ym, ys in zip(y_mean, y_std)
+            ]
+
+            # CI band
+            ax.fill_between(
+                sweep_values,
+                np.array(y_lower).squeeze(),
+                np.array(y_upper).squeeze(),
+                alpha=fill_alpha,
+                edgecolor="none",
+                facecolor=line_color,
+            )
+
+            (handle,) = ax.plot(
+                sweep_values,
+                np.array(y_mean).squeeze(),
+                linewidth=2,
+                linestyle="-",
+                color=line_color,
+                label=f"{base}",
+            )
+            legend_handles.setdefault(f"{base}", handle)
+
+    # Build grid
+    for r, met in enumerate(metrics):
+        add_panel(marginal_methods, axes[r, 0], met)
+        add_panel(covariate_methods, axes[r, 1], met)
+        axes[r, 0].set_ylabel(met)
+
+    # Titles and axes labels
+    for r, met in enumerate(metrics):
+        axes[r, 0].set_title(f"Marginal — {met}")
+        axes[r, 1].set_title(f"Covariate — {met}")
+    axes[-1, 0].set_xlabel("sweep")
+    axes[-1, 1].set_xlabel("sweep")
+
+    # Right-side global legend
+    handles = list(legend_handles.values())
+    labels = [h.get_label() for h in handles]
+    fig.subplots_adjust(right=0.82, top=0.90, hspace=0.35)
+    fig.legend(handles, labels, loc="center left", bbox_to_anchor=(0.84, 0.5))
+    fig.suptitle(title, y=0.98)
+    fig.tight_layout(rect=[0.0, 0.0, 0.82, 0.90])
+
+    sns.despine(fig)
+    return fig

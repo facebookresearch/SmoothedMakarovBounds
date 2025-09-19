@@ -1,0 +1,42 @@
+{
+    "y_grid_size": 300,
+    "monte_carlo_samples": 3000,
+    "monte_carlo_batches": 5,
+    "lgb_params": {
+        "boosting_type": "gbdt",
+        "num_leaves": 8,
+        "max_depth": 8,
+        "min_data_in_leaf": 50,
+        "learning_ra te": 0.06,
+        "verbose": -1,
+        "num_boost_round": 700,
+        "reg_lambda": 0.1,
+        "min_child_weight": 10,
+        "early_stopping_nb": 100,
+        "bagging_frac": 0.8,
+        "bagging_freq": 1,
+        "lambda_l2": 0.1,
+        "n_components": 20
+    },
+    "data_config": {
+        "scm_name": "continuous_uniform2",
+        "n": 5000,
+        "val_frac": 0.1,
+        "test_frac": 0.5,
+        "gamma": 0,
+        "p": 1
+    },
+    "deltas": [0],
+    "t1": [100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 950, 1000,1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 2500, 3000, 4000],
+    "t2": [200, 1000, 3000],
+    "methods": ["envelope_marginal", "smoothing_marginal", "envelope_covariate", "smoothing_covariate", "plugin_marginal", "plugin_covariate"],
+    "bound_types": ["lower", "upper"],
+    "alpha": 0.05,
+    "seed": 0,
+    "sweep_config": {
+        "parameter": "data_config[\"gamma\"]",
+        "values": [0, 0.01, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12]
+    },
+    "use_gt_nuisances": false,
+    "tune_method": "lepski"
+}
