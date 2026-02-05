@@ -1,7 +1,7 @@
-# Assumption-lean inference on treatment effect distributions
+# Risk-aware A/B testing through efficient inference on treatment effect distributions without a margin assumption
 
 About
-This repository provides the code for the paper "Assumption lean inference on treatment effect distributions". It provides methodology for estimating Makarov bounds on the c.d.f. of the treatment effect in A/B tests and reproduces the synthetic experiments in the paper.
+This repository provides the code for the paper "Risk-aware A/B testing through efficient inference on treatment effect distributions without a margin assumption." It provides methodology for estimating Makarov bounds on the c.d.f. of the treatment effect in A/B tests and reproduces the synthetic experiments in the paper.
 
 #### Project structure
 - *methodology.py* contains the core methodology and estimation algorithms
